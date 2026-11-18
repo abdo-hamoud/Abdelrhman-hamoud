@@ -1,0 +1,24 @@
+const origin='https://abdo-hamoud.github.io', repo='abdo-hamoud/Abdelrhman-hamoud', enc=new TextEncoder();
+const headers={'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Methods':'POST, OPTIONS','Access-Control-Allow-Headers':'Authorization, Content-Type','Vary':'Origin','Cache-Control':'no-store'};
+const reply=(v,status=200)=>new Response(JSON.stringify(v),{status,headers:{...headers,'Content-Type':'application/json'}});
+const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const un64=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
+const hmacKey=env=>crypto.subtle.importKey('raw',enc.encode(env.SESSION_SECRET),{name:'HMAC',hash:'SHA-256'},false,['sign','verify']);
+async function passwordHash(password,salt){const k=await crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveBits']);return b64(await crypto.subtle.deriveBits({name:'PBKDF2',salt:un64(salt),iterations:600000,hash:'SHA-256'},k,256))}
+function equal(a,b){if(a.length!==b.length)return false;let v=0;for(let i=0;i<a.length;i++)v|=a.charCodeAt(i)^b.charCodeAt(i);return v===0}
+async function issue(env){const body=b64(enc.encode(JSON.stringify({sub:'portfolio-admin',exp:Math.floor(Date.now()/1000)+1800,jti:crypto.randomUUID()})));return body+'.'+b64(await crypto.subtle.sign('HMAC',await hmacKey(env),enc.encode(body)))}
+async function authorized(req,env){try{const value=req.headers.get('Authorization')||'';if(!value.startsWith('Bearer '))return false;const [p,s,...rest]=value.slice(7).split('.');if(rest.length||!p||!s||p.length>1024||s.length>100)return false;if(!await crypto.subtle.verify('HMAC',await hmacKey(env),un64(s),enc.encode(p)))return false;const x=JSON.parse(new TextDecoder().decode(un64(p)));return x.sub==='portfolio-admin'&&Number.isFinite(x.exp)&&x.exp>Math.floor(Date.now()/1000)}catch{return false}}
+export default{async fetch(req,env){if(req.headers.get('Origin')!==origin)return reply({message:'Forbidden origin'},403);if(req.method==='OPTIONS')return new Response(null,{status:204,headers});if(req.method!=='POST')return reply({message:'Method not allowed'},405);
+if(!env.ADMIN_EMAIL||!env.ADMIN_PASSWORD_HASH||!env.ADMIN_PASSWORD_SALT||!env.SESSION_SECRET||env.SESSION_SECRET.length<32||!env.GITHUB_TOKEN||!env.LOGIN_LIMITER)return reply({message:'Admin setup incomplete'},503);
+try{const path=new URL(req.url).pathname;
+if(path==='/login'){const limit=await env.LOGIN_LIMITER.limit({key:'portfolio-admin'});if(!limit.success)return reply({message:'Too many attempts'},429);const raw=await req.text();if(raw.length>4096)return reply({message:'Bad request'},400);const x=JSON.parse(raw);if(typeof x.email!=='string'||typeof x.password!=='string'||x.password.length>256)return reply({message:'Invalid login'},401);const hash=await passwordHash(x.password,env.ADMIN_PASSWORD_SALT);if(x.email.trim().toLowerCase()!==env.ADMIN_EMAIL.toLowerCase()||!equal(hash,env.ADMIN_PASSWORD_HASH))return reply({message:'Invalid login'},401);return reply({access_token:await issue(env)})}
+if(path!=='/publish')return reply({message:'Not found'},404);if(!await authorized(req,env))return reply({message:'Session expired or invalid'},401);
+if(Number(req.headers.get('Content-Length'))>12000000)return reply({message:'Request too large'},413);const raw=await req.text();if(raw.length>12000000)return reply({message:'Request too large'},413);const x=JSON.parse(raw),prefix='/repos/'+repo+'/contents/';
+const read=x.method==='GET'&&x.path===prefix+'index.html?ref=main';const write=x.method==='PUT'&&x.path===prefix+'index.html';const media=x.method==='PUT'&&typeof x.path==='string'&&x.path.startsWith(prefix)&&/^assets\/admin-\d+-[a-f0-9-]{36}\.(jpg|png|webp|gif)$/.test(x.path.slice(prefix.length));if(!read&&!write&&!media)return reply({message:'Operation forbidden'},403);
+const opts={method:x.method,headers:{Accept:'application/vnd.github+json',Authorization:'Bearer '+env.GITHUB_TOKEN,'X-GitHub-Api-Version':'2022-11-28','User-Agent':'portfolio-admin'}};
+if(!read){const b=x.body;if(!b||typeof b.content!=='string'||b.content.length>11200000||b.content.length%4!==0||!/^[A-Za-z0-9+/]*={0,2}$/.test(b.content))return reply({message:'Invalid content'},400);
+if(write&&(!/^[0-9a-f]{40}$/.test(b.sha||'')||!atob(b.content.slice(0,64)).toLowerCase().includes('<!doctype html>')))return reply({message:'Invalid file or SHA'},400);
+opts.headers['Content-Type']='application/json';opts.body=JSON.stringify({message:write?'Update portfolio via email admin':'Upload portfolio media',content:b.content,branch:'main',...(write?{sha:b.sha}:{})})}
+const result=await fetch('https://api.github.com'+x.path,opts);return reply(await result.json(),result.status);
+}catch{return reply({message:'Unable to complete request'},500)}
+}};
